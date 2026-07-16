@@ -1,0 +1,190 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: "torchtitan"
+spec:
+  clusterIP: None
+  selector:
+    jobset.sigs.k8s.io/jobset-name: "torchtitan"
+---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: "torchtitan-compute-domain"
+spec:
+  numNodes: __NUM_NODES__
+  channel:
+    resourceClaimTemplate:
+      name: "torchtitan-compute-domain"
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: "torchtitan-all-mrdma"
+spec:
+  spec:
+    devices:
+      requests:
+      - name: req-mrdma
+        exactly:
+          deviceClassName: mrdma.google.com
+          allocationMode: ExactCount
+          count: 8
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "torchtitan"
+  namespace: default
+spec:
+  suspend: false
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: workload
+    replicas: 1
+    template:
+      spec:
+        parallelism: __NUM_NODES__
+        completions: __NUM_NODES__
+        backoffLimit: 0
+        completionMode: Indexed
+        activeDeadlineSeconds: 14400 # 4 hours
+        ttlSecondsAfterFinished: 43200 # 12 hours
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/default-container: workload
+              kueue.x-k8s.io/podset-preferred-topology: kubernetes.io/hostname
+          spec:
+            subdomain: "torchtitan"
+            restartPolicy: Never
+
+            tolerations:
+            - operator: "Exists"
+              key: nvidia.com/gpu
+            - operator: "Exists"
+              key: cloud.google.com/impending-node-termination
+            - key: "kubernetes.io/arch"
+              operator: "Equal"
+              value: "arm64"
+              effect: "NoSchedule"
+
+            volumes:
+            - name: gib
+              hostPath:
+                path: /home/kubernetes/bin/gib
+            - name: shared-memory
+              emptyDir:
+                medium: "Memory"
+                sizeLimit: 250Gi
+
+            resourceClaims:
+            - name: compute-domain-channel
+              resourceClaimTemplateName: "torchtitan-compute-domain"
+            - name: rdma
+              resourceClaimTemplateName: "torchtitan-all-mrdma"
+
+            containers:
+            - name: workload
+              image: "nvcr.io/nvidia/pytorch:26.06-py3"
+              imagePullPolicy: Always
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              env:
+              - name: JOB_IDENTIFIER
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOB_COMPLETION_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+              - name: MASTER_ADDR
+                value: "torchtitan-workload-0-0.torchtitan.default.svc.cluster.local"
+              - name: MASTER_PORT
+                value: "6002"
+              - name: NNODES
+                value: "__NUM_NODES__"
+              - name: GPUS_PER_NODE
+                value: "4"
+              - name: NCCL_PLUGIN_PATH
+                value: /usr/local/gib/lib64
+              - name: NCCL_ENV_PLUGIN
+                value: gcp
+              - name: NCCL_DEBUG
+                value: INFO
+              - name: ARTIFACT_DIR
+                value: /tmp/artifacts
+              command:
+              - bash
+              - -c
+              - |
+                echo "Pod on $(hostname --fqdn) is running"
+                echo "Pod is assigned job index of $JOB_COMPLETION_INDEX"
+
+                set -ex
+
+                # Prepend GIB to LD_LIBRARY_PATH
+                export LD_LIBRARY_PATH=/usr/local/gib/lib64:$LD_LIBRARY_PATH
+
+                # Unset NCCL_NET_PLUGIN if it is forcing spcx
+                unset NCCL_NET_PLUGIN
+
+                # Calculate WORLD_SIZE
+                export WORLD_SIZE=$((${NNODES} * ${GPUS_PER_NODE}))
+
+                # Install dependencies
+                pip3 install --no-cache-dir --upgrade pip
+                pip3 install --no-cache-dir --pre torchtitan einops torchao
+
+                echo "Launching Torch distributed on rank ${JOB_COMPLETION_INDEX}/${NNODES}"
+                echo "MASTER: ${MASTER_ADDR}:${MASTER_PORT}"
+                echo "JOB_ID: ${JOB_IDENTIFIER}"
+
+                mkdir -p "${ARTIFACT_DIR}"
+
+                torchrun_args=(
+                  --nnodes="${NNODES}"
+                  --nproc_per_node="${GPUS_PER_NODE}"
+                  --rdzv_backend=static
+                  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}"
+                  --node_rank="${JOB_COMPLETION_INDEX}"
+                  --rdzv_id="${JOB_IDENTIFIER}"
+                )
+
+                workload_args=(
+                  -m torchtitan.train
+                  --module llama3
+                  --config llama3_8b
+                  --training.steps=30
+                  --metrics.log-freq=5
+                  --dump-folder="${ARTIFACT_DIR}"
+                  --metrics.save-tb-folder=tb
+                  --metrics.enable-tensorboard
+                  --hf-assets-path=/opt/pytorch/torchtitan/tests/assets/tokenizer
+                  --dataloader.dataset-path=/opt/pytorch/torchtitan/tests/assets/c4_test
+                  --dataloader.dataset c4_test
+                )
+
+                torchrun "${torchrun_args[@]}" "${workload_args[@]}"
+
+                echo "Training completed"
+
+                if [[ "${JOB_COMPLETION_INDEX}" == "0" ]]; then
+                  nvidia-smi | tee "${ARTIFACT_DIR}/nvidia-smi.txt"
+                fi
+
+                echo "Pod on $(hostname --fqdn) is exiting"
+              volumeMounts:
+                - name: gib
+                  mountPath: /usr/local/gib
+                - name: shared-memory
+                  mountPath: /dev/shm
+              resources:
+                limits:
+                  nvidia.com/gpu: 4
+                claims:
+                - name: compute-domain-channel
+                - name: rdma
