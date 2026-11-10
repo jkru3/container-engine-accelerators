@@ -91,6 +91,9 @@ spec:
     env:
     - name: LD_LIBRARY_PATH
       value: /usr/local/nvidia/lib64
+    # Skip hwloc PCI discovery, which can stall OpenMPI on GB300
+    - name: HWLOC_COMPONENTS
+      value: "-pci"
     resources:
       limits:
         nvidia.com/gpu: 4
@@ -100,6 +103,8 @@ spec:
     command: ["/bin/bash", "-c"]
     args:
     - |
+      # Cap open files so OpenMPI does not stall closing fds (sshd inherits it)
+      ulimit -n 65536
       /scripts/container_entry.sh shell
       sleep infinity
   resourceClaims:
@@ -159,6 +164,9 @@ spec:
     env:
     - name: LD_LIBRARY_PATH
       value: /usr/local/nvidia/lib64
+    # Skip hwloc PCI discovery, which can stall OpenMPI on GB300
+    - name: HWLOC_COMPONENTS
+      value: "-pci"
     resources:
       limits:
         nvidia.com/gpu: 4
@@ -168,6 +176,8 @@ spec:
     command: ["/bin/bash", "-c"]
     args:
     - |
+      # Cap open files so OpenMPI does not stall closing fds (sshd inherits it)
+      ulimit -n 65536
       /scripts/container_entry.sh shell
       sleep infinity
   resourceClaims:

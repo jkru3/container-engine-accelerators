@@ -98,11 +98,16 @@ spec:
                   value: "__NUM_NODES__"
                 - name: LD_LIBRARY_PATH
                   value: /usr/local/nvidia/lib64
+                # Skip hwloc PCI discovery, which can stall OpenMPI on GB300
+                - name: HWLOC_COMPONENTS
+                  value: "-pci"
                 command:
                 - bash
                 - -c
                 - |
                   set -x
+                  # Cap open files so OpenMPI does not stall closing fds (sshd inherits it)
+                  ulimit -n 65536
                   echo "Starting workload container on ${MY_NODE_NAME} for $N_NODES benchmark"
                   # Install ping
                   apt update -y
